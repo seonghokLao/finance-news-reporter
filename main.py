@@ -2,59 +2,101 @@ import os
 import streamlit as st
 import pickle
 import time
-from langchain import OpenAI
+import pandas as pd
+from dotenv import load_dotenv
+
+from langchain_openai import ChatOpenAI
 from langchain.chains import RetrievalQAWithSourcesChain
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.document_loaders import UnstructuredURLLoader
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
+from langchain_community.document_loaders import UnstructuredURLLoader
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.schema import HumanMessage
 
-from dotenv import load_dotenv
-load_dotenv()  # take environment variables from .env (especially openai api key)
+from datetime import datetime, timedelta
+
+from util import *
+
+# Load environment variables
+load_dotenv()
 
 st.title("Finance News Reporter")
-st.sidebar.title("News Article URLs")
+st.sidebar.title("Web Scraper")
 
-urls = []
-for i in range(3):
-    url = st.sidebar.text_input(f"URL {i+1}")
-    urls.append(url)
+# --- Sidebar Inputs ---
+sites = ["All", "FMP", "newsdata.io"]
+site = st.sidebar.selectbox("Sources", sites)
 
-submitted = st.sidebar.button("submit")
-faiss_path = "faiss_store.pkl"
-
+keyword = st.sidebar.text_input("Keywords (Optional)", value="")
+summarize = st.sidebar.toggle("Summarize News")
+submitted = st.sidebar.button("Submit")
+faiss_path = "faiss_store/faiss_store.pkl"
 main_placeholder = st.empty()
-llm = OpenAI(temperature=0.9, max_tokens=500)
+llm = ChatOpenAI(model_name="gpt-4.1-nano", temperature=0.3, max_tokens=500)
+
+query = None
+
+data = []
 
 if submitted:
-    # load articles
-    loader = UnstructuredURLLoader(urls=urls)
-    main_placeholder.text("Loading Articles...")
-    data = loader.load()
 
-    # split data
-    text_splitter = RecursiveCharacterTextSplitter(
-        separators=['\n\n', '\n', '.', ','],
-        chunk_size=1000
-    )
-    main_placeholder.text("Splitting Text....")
-    chunks = text_splitter.split_documents(data)
+    if site in ["All", "FMP"]:
+        main_placeholder.text("Scraping...")
+        # since_date = (datetime.utcnow() - timedelta(days=0)).strftime('%Y-%m-%d')
 
-    # create embeddings
-    embeddings = OpenAIEmbeddings()
-    vectorstore = FAISS.from_documents(chunks, embeddings)
-    main_placeholder.text("Building Embeddings...")
-    
-    with open(faiss_path, 'wb') as f:
-        pickle.dump(vectorstore, f)
+        data += call_fmp_api(api_key=os.getenv("FMP_API_KEY"))
 
+    # print(data)
+    if not data:
+        st.warning("No articles found.")
+    else:
+        text_splitter = RecursiveCharacterTextSplitter(
+            separators=['\n\n', '\n', '.', ','],
+            chunk_size=1000
+        )
+        main_placeholder.text("Splitting Text....")
+        chunks = text_splitter.split_documents(data)
+
+        # print(chunks)
+
+        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        vectorstore = FAISS.from_documents(chunks, embeddings)
+        main_placeholder.text("Building Embeddings...")
+
+        with open(faiss_path, 'wb') as f:
+            pickle.dump(vectorstore, f)
+
+        st.success("News embedded successfully. You can start asking questions.")
+
+# --- Summary Generation ---
+if summarize and data:
+    st.subheader("Summarized Articles:")
+    for doc in data:
+        print("Summarizing article")
+        prompt = f"In two sentences, tell me the economic implications, if any, and which specific stock prices might be affected, if any.: {doc.page_content}"
+        try:
+            summary = llm([HumanMessage(content=prompt)]).content
+            st.markdown(f"**{doc.metadata.get('title', 'Untitled')}**\n- {summary}")
+        except Exception as e:
+            st.warning(f"Failed to summarize article: {e}")
+
+# --- Question Answering ---
 query = main_placeholder.text_input("Question: ")
 
 if query and os.path.exists(faiss_path):
     with open(faiss_path, "rb") as f:
         vectorstore = pickle.load(f)
-        chain = RetrievalQAWithSourcesChain.fromllm(llm=llm, retriever=vectorstore.as_retriever())
+        print("Retrieving Answer")
+        chain = RetrievalQAWithSourcesChain.from_llm(llm=llm, retriever=vectorstore.as_retriever())
         result = chain({"question": query}, return_only_outputs=True)
+        print("got answer")
 
+        st.header("Answer:")
+        st.write(result["answer"])
 
-        
+        sources = result.get("sources", "")
+        if sources:
+            st.subheader("Sources:")
+            sources = sources.split("\n")
+            for source in sources:
+                st.write(source)
